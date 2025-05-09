@@ -3,6 +3,13 @@
 
 ## Setup Instructions
 
+### 1. Clone git repository
+
+```bash
+git clone https://github.com/jr4fs/CaseFlo.git
+cd CaseFlo
+```
+
 ### 1. Create a Conda Environment
 
 ```bash
