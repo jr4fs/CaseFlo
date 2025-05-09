@@ -1,15 +1,18 @@
 # CaseFlo
 
 
-## 📦 Setup Instructions
+## Setup Instructions
 
 ### 1. Create a Conda Environment
 
 ```bash
 conda create -n caseflo python=3.10 -y
 conda activate caseflo
+```
+### 2. Install Requirements
 
 pip install -r requirements.txt
 python -m spacy download en_core_web_lg
 
-python anonymize_text.py --file input.txt --output anonymized.txt
+### 2. Example Usage
+python anonymizer.py --file input.csv --output anonymized.csv
