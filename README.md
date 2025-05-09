@@ -16,5 +16,5 @@ python -m spacy download en_core_web_lg
 ```
 ### 2. Example Usage
 ```bash
-python src/anonymizer.py --file input.csv --output anonymized.csv
+python src/anonymizer.py --file input.csv --output anonymized.csv --column <name of column with text to anonymize>
 ```
