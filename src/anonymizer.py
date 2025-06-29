@@ -14,7 +14,20 @@ from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 import pandas as pd
 import os
 import argparse
+import re 
+from spacy.pipeline import EntityRuler
 
+# get a list of names -- full names and names of people, nicknames, 
+# christian will give us a list of names
+
+def enhance_spacy_with_rules(nlp):
+    ruler = nlp.add_pipe("entity_ruler", before="ner")
+    patterns = [
+        {"label": "PERSON", "pattern": [{"LOWER": "dr"}, {"IS_TITLE": True}]},
+        {"label": "PERSON", "pattern": [{"LOWER": "mr"}, {"IS_TITLE": True}]},
+    ]
+    ruler.add_patterns(patterns)
+    return nlp
 
 
 def configure_nlp_engine(language='en'):
@@ -27,47 +40,17 @@ def configure_nlp_engine(language='en'):
     return nlp_engine
 
 def analyze_text_with_presidio(text, nlp_engine, language='en'):
-    titles_recognizer = PatternRecognizer(supported_entity="TITLE",
-                                          deny_list=["Mr.","Mrs.","Miss"])
-    pronoun_recognizer = PatternRecognizer(supported_entity="PRONOUN",
-                                          deny_list=["he", "He", "his", "His", "she", "She", "her" "hers", "Hers"])
+    # titles_recognizer = PatternRecognizer(supported_entity="TITLE",
+    #                                       deny_list=["Mr.","Mrs.","Miss"])
+    # pronoun_recognizer = PatternRecognizer(supported_entity="PRONOUN",
+    #                                       deny_list=["he", "He", "his", "His", "she", "She", "her" "hers", "Hers"])
 
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language])
-    analyzer.registry.add_recognizer(titles_recognizer)
-    analyzer.registry.add_recognizer(pronoun_recognizer)
+    # analyzer.registry.add_recognizer(titles_recognizer)
+    # analyzer.registry.add_recognizer(pronoun_recognizer)
+
     results = analyzer.analyze(text=text, language=language)
     return results
-
-
-def anonymize_entities(text, model_name):
-    nlp = spacy.load(model_name)
-    # Process the text with spaCy NER
-    doc = nlp(text)
-    # Define a mapping for entity labels to their anonymized values
-    entity_mapping = {
-        "PERSON": "<PERSON>",
-        # "ORG": "<ORGANIZATION>",
-        "GPE": "<LOCATION>",
-        "DATE": "<DATE_TIME>",
-        "CARDINAL": "<NUMBER>"
-    }
-    # Create a list to store the anonymized text segments
-    anonymized_text_segments = []
-    # Track the end of the last entity to handle non-entity text
-    last_end = 0
-    for ent in doc.ents:
-        # Append the text before the current entity
-        anonymized_text_segments.append(text[last_end:ent.start_char])
-        # Append the anonymized value for the current entity
-        anonymized_value = entity_mapping.get(ent.label_, ent.text)
-        anonymized_text_segments.append(anonymized_value)
-        # Update the end position of the last entity
-        last_end = ent.end_char
-    # Append any remaining text after the last entity
-    anonymized_text_segments.append(text[last_end:])
-    # Combine all the text segments into the final anonymized text
-    anonymized_text = "".join(anonymized_text_segments)
-    return anonymized_text
 
 def analyze_text_with_spacy(text, nlp):
     doc = nlp(text)
@@ -99,7 +82,6 @@ def analyze_text_with_spacy(text, nlp):
     return results
 
 
-
 def merge_results(presidio_results, spacy_results):
     presidio_results = presidio_results or []
     spacy_results = spacy_results or []
@@ -122,22 +104,44 @@ def anonymize_text(text, analyzer_results):
         "LOCATION": OperatorConfig("replace", {"new_value": "<LOCATION>"}),
         "DATE": OperatorConfig("replace", {"new_value": "<DATE_TIME>"}),
         "DATE_TIME": OperatorConfig("replace", {"new_value": "<DATE_TIME>"}),
-        # "ORGANIZATION": OperatorConfig("replace", {"new_value": "<ORGANIZATION>"}),
         "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "<PHONE_NUMBER>"}),
         "CREDIT_CARD": OperatorConfig("replace", {"new_value": "<CREDIT_CARD>"})
     }
     return anonymizer.anonymize(text=text, analyzer_results=analyzer_results, operators=operator_config).text
 
+# Define a cleaning function
+def clean_cell(cell):
+    if isinstance(cell, str):
+        return ' '.join(cell.split()).lower()  # Removes excessive whitespace and newlines
+    return cell
+
+def redact_names(text, names_to_redact, replacement="[REDACTED]"):
+    if pd.isna(text):
+        return text
+
+    for name in names_to_redact:
+        # Skip empty strings
+        if not name.strip():
+            continue
+        # Regex to match name as whole word
+        pattern = r'\b{}\b'.format(re.escape(name))
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
 
 def main():
     parser = argparse.ArgumentParser(description="Anonymize text using spaCy + Presidio.")
-    parser.add_argument('--file', type=str, required=True, help='Path to input .csv file')
-    parser.add_argument('--column', type=str, default='Notes', help='Column to anonymize (only for CSV)')
-    parser.add_argument('--output', type=str, default='anonymized.csv', help='Output CSV file path (required for CSV input)', required=True)
+    parser.add_argument('--file', type=str, default='notes.csv', help='Path to input .csv file with the original notes')
+    parser.add_argument('--column', type=str, default='Notes', help='The name of the column in file which contains the notes')
+    parser.add_argument('--output', type=str, default='anonymized.csv', help='Output CSV file path (required for CSV input)')
+    parser.add_argument('--provided_names', type=str, default='names.csv', help='Path to the file which contains all the provided names, expecting columns: First Name, Middle Name, Last Name, Other Name 1, Other Name 2, Other Name 3, Other Name 4, Other Name 5')
+
 
     args = parser.parse_args()
     input_path = args.file
     output_path = args.output
+    names_path = args.provided_names
+    columns_with_names = ['First Name', 'Middle Name', 'Last Name', 'Other Name 1', 'Other Name 2', 'Other Name 3', 'Other Name 4', 'Other Name 5']
 
     # Setup NLP engines
     nlp_engine = configure_nlp_engine()
@@ -147,6 +151,9 @@ def main():
         df = pd.read_csv(input_path)
         if args.column not in df.columns:
             raise ValueError(f"Column '{args.column}' not found in CSV.")
+        
+        df[args.column] = df[args.column].apply(clean_cell)
+
 
         # Anonymize each row in the specified column
         df[f'{args.column}_anonymized'] = df[args.column].apply(lambda text: anonymize_text(
@@ -156,6 +163,29 @@ def main():
                 analyze_text_with_spacy(text, spacy_nlp)
             )
         ))
+
+        # Anonymize in second path
+        names_df = pd.read_csv(names_path)
+        all_names_series = pd.concat([names_df[col] for col in columns_with_names if col in names_df.columns])
+        # Clean names
+        name_list = (
+            all_names_series
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .unique()
+            .tolist()
+        )
+        print(f"Loaded {len(name_list)} unique names to check.")
+
+        df[f'{args.column}_final_anonymized'] = df[f'{args.column}_anonymized'].apply(
+            lambda x: redact_names(x, name_list)
+)
+
+
+
+
+
         df.to_csv(output_path, index=False)
         print(f"Anonymized CSV saved to: {output_path}")
 
