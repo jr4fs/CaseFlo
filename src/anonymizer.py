@@ -23,9 +23,10 @@ from spacy.pipeline import EntityRuler
 def enhance_spacy_with_rules(nlp):
     ruler = nlp.add_pipe("entity_ruler", before="ner")
     patterns = [
-        {"label": "PERSON", "pattern": [{"LOWER": "dr"}, {"IS_TITLE": True}]},
-        {"label": "PERSON", "pattern": [{"LOWER": "mr"}, {"IS_TITLE": True}]},
+        {"label": "PERSON", "pattern": [{"LOWER": {"IN": ["dr", "mr", "mrs", "ms", "miss"]}}, {"IS_TITLE": True}]},
+        {"label": "PERSON", "pattern": [{"LOWER": {"IN": ["dr", "mr", "mrs", "ms", "miss"]}}, {"IS_ALPHA": True}]},
     ]
+
     ruler.add_patterns(patterns)
     return nlp
 
@@ -115,16 +116,34 @@ def clean_cell(cell):
         return ' '.join(cell.split()).lower()  # Removes excessive whitespace and newlines
     return cell
 
+# def redact_names(text, names_to_redact, replacement="[REDACTED]"):
+#     if pd.isna(text):
+#         return text
+
+#     for name in names_to_redact:
+#         # Skip empty strings
+#         if not name.strip():
+#             continue
+#         # Regex to match name as whole word
+#         pattern = r'\b{}\b'.format(re.escape(name))
+#         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+#     return text
 def redact_names(text, names_to_redact, replacement="[REDACTED]"):
     if pd.isna(text):
         return text
 
     for name in names_to_redact:
-        # Skip empty strings
-        if not name.strip():
+        n = name.strip()
+        if not n:
             continue
-        # Regex to match name as whole word
-        pattern = r'\b{}\b'.format(re.escape(name))
+
+        # Single-letter initial -> allow optional trailing period
+        if len(n) == 1 and n.isalpha():
+            pattern = rf'(?<!\w){re.escape(n)}\.?(?!\w)'
+        else:
+            # Use lookarounds instead of \b to handle trailing punctuation cleanly
+            pattern = rf'(?<!\w){re.escape(n)}(?!\w)'
+
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
 
@@ -181,9 +200,6 @@ def main():
         df[f'{args.column}_final_anonymized'] = df[f'{args.column}_anonymized'].apply(
             lambda x: redact_names(x, name_list)
 )
-
-
- 
 
 
         df.to_csv(output_path, index=False)
