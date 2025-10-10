@@ -2,3 +2,4 @@ presidio-analyzer
 presidio-anonymizer
 spacy
 pandas
+tqdm

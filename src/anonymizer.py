@@ -1,189 +1,258 @@
+import re
+import argparse
+import pandas as pd
+
 import spacy
-from presidio_analyzer import (
-    AnalyzerEngine,
-    Pattern,
-    PatternRecognizer,
-    RecognizerResult,
-)
-from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer import AnalyzerEngine, RecognizerResult, PatternRecognizer, Pattern
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
-import time
-from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
-import pandas as pd
-import os
-import argparse
-import re 
-from spacy.pipeline import EntityRuler
 
+# ---- tqdm (progress bars) with safe fallback ----
+try:
+    from tqdm import tqdm
+    from tqdm.contrib import tzip
+    TQDM_AVAILABLE = True
+except Exception:
+    TQDM_AVAILABLE = False
+    class tqdm:  # fallback no-op
+        def __init__(self, iterable=None, total=None, **kwargs):
+            self.iterable = iterable or []
+        def __iter__(self):
+            for x in self.iterable:
+                yield x
+        def update(self, *args, **kwargs): pass
+        def close(self): pass
+        @staticmethod
+        def write(msg): print(msg)
+    def tzip(*args, **kwargs):
+        return zip(*args)
 
-def enhance_spacy_with_rules(nlp):
-    ruler = nlp.add_pipe("entity_ruler", before="ner")
-    patterns = [
-        {"label": "PERSON", "pattern": [{"LOWER": {"IN": ["dr", "mr", "mrs", "ms", "miss"]}}, {"IS_TITLE": True}]},
-        {"label": "PERSON", "pattern": [{"LOWER": {"IN": ["dr", "mr", "mrs", "ms", "miss"]}}, {"IS_ALPHA": True}]},
-    ]
+# -----------------------------
+# Domain allow/deny specifics
+# -----------------------------
+ALLOWLIST_TERMS = {"yp", "hcm"}          # never redact
+DPSS_TOKEN = "<AGENCY>"                  # force redaction token for DPSS
+PRONOUNS = {
+    "he", "him", "his",
+    "she", "her", "hers",
+    "they", "them", "their", "theirs",
+    "ze", "zir", "zirself", "xe", "xem", "xyr"
+}
+REDACT_FIRST_MIDDLE_INITIAL_NO_LAST = True  # catch "Jay S." style
 
-    ruler.add_patterns(patterns)
-    return nlp
-
-
-def configure_nlp_engine(language='en'):
-    configuration = {
-        "nlp_engine_name": "spacy",
-        "models": [{"lang_code": language, "model_name": "en_core_web_lg"}],
-    }
-    provider = NlpEngineProvider(nlp_configuration=configuration)
-    nlp_engine = provider.create_engine()
-    return nlp_engine
-
-def analyze_text_with_presidio(text, nlp_engine, language='en'):
-    analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language])
-    results = analyzer.analyze(text=text, language=language)
-    return results
-
-def analyze_text_with_spacy(text, nlp):
-    doc = nlp(text)
-    
-    # Map spaCy labels to standardized Presidio-compatible labels
-    entity_mapping = {
-        "PERSON": "PERSON",
-        # "ORG": "ORGANIZATION",
-        "GPE": "LOCATION",
-        "DATE": "DATE_TIME",
-        "TIME": "DATE_TIME",
-        "CARDINAL": "NUMBER",
-        "LOC": "LOCATION",
-        "FAC": "LOCATION"
-    }
-
-    results = []
-    for ent in doc.ents:
-        if ent.label_ in entity_mapping:
-            mapped_entity = entity_mapping[ent.label_]
-            results.append(
-                RecognizerResult(
-                    entity_type=mapped_entity,
-                    start=ent.start_char,
-                    end=ent.end_char,
-                    score=0.85
-                )
-            )
-    return results
-
-
-def merge_results(presidio_results, spacy_results):
-    presidio_results = presidio_results or []
-    spacy_results = spacy_results or []
-
-    unique = {(r.start, r.end): r for r in spacy_results}
-
-    for r in presidio_results:
-        key = (r.start, r.end)
-        if key not in unique:
-            unique[key] = r
-
-    return list(unique.values())
-
-def anonymize_text(text, analyzer_results):
-    anonymizer = AnonymizerEngine()
-    operator_config = {
-        "PERSON": OperatorConfig("replace", {"new_value": "<PERSON>"}),
-        "LOCATION": OperatorConfig("replace", {"new_value": "<LOCATION>"}),
-        "DATE": OperatorConfig("replace", {"new_value": "<DATE_TIME>"}),
-        "DATE_TIME": OperatorConfig("replace", {"new_value": "<DATE_TIME>"}),
-        "PHONE_NUMBER": OperatorConfig("replace", {"new_value": "<PHONE_NUMBER>"}),
-        "CREDIT_CARD": OperatorConfig("replace", {"new_value": "<CREDIT_CARD>"})
-    }
-    return anonymizer.anonymize(text=text, analyzer_results=analyzer_results, operators=operator_config).text
-
-# Define a cleaning function
+# -----------------------------
+# Utilities
+# -----------------------------
 def clean_cell(cell):
     if isinstance(cell, str):
-        return ' '.join(cell.split()).lower()  # Removes excessive whitespace and newlines
+        return ' '.join(cell.split())
     return cell
 
-def redact_names(text, names_to_redact, replacement="[REDACTED]"):
-    if pd.isna(text):
+# -----------------------------
+# PASS 1: Names-first redaction
+# -----------------------------
+def build_row_name_patterns(row):
+    """
+    Build robust regex patterns from one CSV row:
+      - Redact any mention combo of First/Middle/Last (incl. initials & pairs).
+      - Do NOT redact a single-letter middle by itself.
+      - Catch possessives like "Doe's".
+    """
+    pats = []
+
+    first  = str(row.get("First Name", "") or "").strip()
+    middle = str(row.get("Middle Name", "") or "").strip()
+    last   = str(row.get("Last Name", "") or "").strip()
+
+    other_cols = [c for c in row.index if c.lower().startswith("other name")]
+    others = [str(row.get(c, "") or "").strip() for c in other_cols if str(row.get(c, "") or "").strip()]
+
+    def add_whole_word(name, tag="<PERSON>"):
+        if name and len(name) > 1:
+            rx = re.compile(rf"(?i)\b{re.escape(name)}\b(?:[’']s)?")
+            pats.append((rx, tag))
+
+    def add_pair_possessive(a, b, sep=r"\s+"):
+        rx = re.compile(rf"(?i)\b{re.escape(a)}{sep}{re.escape(b)}\b(?:[’']s)?")
+        pats.append((rx, "<PERSON>"))
+
+    # Standalone names (multi-char only)
+    add_whole_word(first)
+    add_whole_word(last)
+    if middle and len(middle) > 1:
+        add_whole_word(middle)
+
+    # Aliases in "Other Name i"
+    for on in others:
+        add_whole_word(on)
+
+    if first and last:
+        first_initial = first[0]
+        # First Last (+ possessive)
+        add_pair_possessive(first, last)
+
+        if middle:
+            if len(middle) == 1:
+                # First M Last / First M. Last (+ possessive)
+                rx = re.compile(rf"(?i)\b{re.escape(first)}\s+{re.escape(middle)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+                # F. M. Last (+ possessive)
+                rx = re.compile(rf"(?i)\b{re.escape(first_initial)}\.?\s+{re.escape(middle)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+                # F. Last (+ possessive)
+                rx = re.compile(rf"(?i)\b{re.escape(first_initial)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+            else:
+                # First Middle Last (+ possessive)
+                rx = re.compile(rf"(?i)\b{re.escape(first)}\s+{re.escape(middle)}\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+                # First M. Last / F. M. Last / F. Last
+                m_initial = middle[0]
+                rx = re.compile(rf"(?i)\b{re.escape(first)}\s+{re.escape(m_initial)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+                rx = re.compile(rf"(?i)\b{re.escape(first_initial)}\.?\s+{re.escape(m_initial)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+                rx = re.compile(rf"(?i)\b{re.escape(first_initial)}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+                pats.append((rx, "<PERSON>"))
+    # "First M." without last (e.g., Jay S.)
+    if REDACT_FIRST_MIDDLE_INITIAL_NO_LAST and first and middle and len(middle) == 1:
+        rx = re.compile(rf"(?i)\b{re.escape(first)}\s+{re.escape(middle)}\.?(?=\b|[^A-Za-z])")
+        pats.append((rx, "<PERSON>"))
+        # Optionally "F. M."
+        rx = re.compile(rf"(?i)\b{re.escape(first[0])}\.?\s*{re.escape(middle)}\.?(?=\b|[^A-Za-z])")
+        pats.append((rx, "<PERSON>"))
+
+    if last and first:
+        # Initial + Last, even if first not spelled out elsewhere
+        rx = re.compile(rf"(?i)\b{re.escape(first[0])}\.?\s+{re.escape(last)}\b(?:[’']s)?")
+        pats.append((rx, "<PERSON>"))
+
+    return pats
+
+def redact_names_pass(text, all_row_patterns):
+    if not isinstance(text, str) or not text:
         return text
+    out = text
+    for pats in all_row_patterns:
+        for rx, repl in pats:
+            out = rx.sub(repl, out)
+    return out
 
-    for name in names_to_redact:
-        n = name.strip()
-        if not n:
+# -----------------------------
+# PASS 2: PII via Presidio
+# -----------------------------
+def configure_nlp_engine(language='en'):
+    configuration = {"nlp_engine_name": "spacy", "models": [{"lang_code": language, "model_name": "en_core_web_lg"}]}
+    provider = NlpEngineProvider(nlp_configuration=configuration)
+    return provider.create_engine()
+
+def analyze_with_presidio(text, nlp_engine, language='en'):
+    analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language])
+
+    # Force-recognize DPSS as ORGANIZATION (we'll remap output token below)
+    analyzer.registry.add_recognizer(
+        PatternRecognizer(
+            supported_entity="ORGANIZATION",
+            name="force_dpss_org",
+            patterns=[Pattern(name="DPSS", regex=r"\bDPSS\b", score=0.9)]
+        )
+    )
+
+    results = analyzer.analyze(text=text, language=language)
+
+    # Filter allowlist (YP/HCM) from results, regardless of detected type
+    filtered = []
+    for r in results:
+        span = text[r.start:r.end]
+        if span.strip().lower() in ALLOWLIST_TERMS:
             continue
+        filtered.append(r)
 
-        # Single-letter initial -> allow optional trailing period
-        if len(n) == 1 and n.isalpha():
-            pattern = rf'(?<!\w){re.escape(n)}\.?(?!\w)'
-        else:
-            # Use lookarounds instead of \b to handle trailing punctuation cleanly
-            pattern = rf'(?<!\w){re.escape(n)}(?!\w)'
+    return filtered
 
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    return text
+def anonymize_text(text, analyzer_results, redact_pronouns=False):
+    anonymizer = AnonymizerEngine()
+    operators = {
+        "PERSON":        OperatorConfig("replace", {"new_value": "<PERSON>"}),
+        "LOCATION":      OperatorConfig("replace", {"new_value": "<LOCATION>"}),
+        "ORGANIZATION":  OperatorConfig("replace", {"new_value": "<ORG>"}),  # DPSS normalized below
+        "EMAIL_ADDRESS": OperatorConfig("replace", {"new_value": "<EMAIL>"}),
+        "PHONE_NUMBER":  OperatorConfig("replace", {"new_value": "<PHONE_NUMBER>"}),
+        "CREDIT_CARD":   OperatorConfig("replace", {"new_value": "<CREDIT_CARD>"}),
+        "DATE":          OperatorConfig("replace", {"new_value": r"\g<0>"}),  # no-op (avoid redacting "afternoon")
+        "DATE_TIME":     OperatorConfig("replace", {"new_value": r"\g<0>"}),  # no-op
+        "NUMBER":        OperatorConfig("replace", {"new_value": "<NUMBER>"}),
+    }
 
+    out = anonymizer.anonymize(text=text, analyzer_results=analyzer_results, operators=operators).text
 
+    # Ensure DPSS becomes <AGENCY>, not <ORG>
+    out = re.sub(r"\bDPSS\b", DPSS_TOKEN, out, flags=re.IGNORECASE)
+
+    if redact_pronouns:
+        pron_pat = r"\b(" + "|".join(sorted(PRONOUNS, key=len, reverse=True)) + r")\b"
+        out = re.sub(pron_pat, "<PRONOUN>", out, flags=re.IGNORECASE)
+
+    return out
+
+# -----------------------------
+# MAIN (with progress bars)
+# -----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Anonymize text using spaCy + Presidio.")
-    parser.add_argument('--file', type=str, default='notes.csv', help='Path to input .csv file with the original notes')
-    parser.add_argument('--column', type=str, default='Notes', help='The name of the column in file which contains the notes')
-    parser.add_argument('--output', type=str, default='anonymized.csv', help='Output CSV file path (required for CSV input)')
-    parser.add_argument('--provided_names', type=str, default='names.csv', help='Path to the file which contains all the provided names, expecting columns: First Name, Middle Name, Last Name, Other Name 1, Other Name 2, Other Name 3, Other Name 4, Other Name 5')
-
+    parser = argparse.ArgumentParser(description="Anonymize text with names-first pass + Presidio, with progress bars.")
+    parser.add_argument('--file', type=str, required=True, help='Path to input .csv with notes')
+    parser.add_argument('--column', type=str, default='Notes', help='Column in CSV with the notes')
+    parser.add_argument('--output', type=str, required=True, help='Output CSV file path')
+    parser.add_argument('--provided_names', type=str, required=True, help='CSV with name columns: First Name, Middle Name, Last Name, Other Name 1..5')
+    parser.add_argument('--redact_pronouns', action='store_true', help='If set, also redact pronouns')
 
     args = parser.parse_args()
-    input_path = args.file
-    output_path = args.output
-    names_path = args.provided_names
-    columns_with_names = ['First Name', 'Middle Name', 'Last Name', 'Other Name 1', 'Other Name 2', 'Other Name 3', 'Other Name 4', 'Other Name 5']
 
-    # Setup NLP engines
-    nlp_engine = configure_nlp_engine()
-    spacy_nlp = spacy.load("en_core_web_lg")
+    df = pd.read_csv(args.file)
+    if args.column not in df.columns:
+        raise ValueError(f"Column '{args.column}' not found in {args.file}")
 
-    if input_path.endswith('.csv'):
-        df = pd.read_csv(input_path)
-        if args.column not in df.columns:
-            raise ValueError(f"Column '{args.column}' not found in CSV.")
-        
-        df[args.column] = df[args.column].apply(clean_cell)
+    df[args.column] = df[args.column].apply(clean_cell)
 
+    names_df = pd.read_csv(args.provided_names)
+    expected_cols = [c for c in ["First Name", "Middle Name", "Last Name",
+                                 "Other Name 1", "Other Name 2", "Other Name 3", "Other Name 4", "Other Name 5"]
+                     if c in names_df.columns]
+    if not expected_cols:
+        raise ValueError("No expected name columns found in provided_names CSV.")
 
-        # Anonymize each row in the specified column
-        df[f'{args.column}_anonymized'] = df[args.column].apply(lambda text: anonymize_text(
-            text,
-            merge_results(
-                analyze_text_with_presidio(text, nlp_engine),
-                analyze_text_with_spacy(text, spacy_nlp)
-            )
-        ))
+    # Build patterns per row (progress)
+    all_row_patterns = []
+    t = tqdm(total=len(names_df), desc="Building name patterns", unit="row") if TQDM_AVAILABLE else None
+    for _, row in names_df[expected_cols].iterrows():
+        all_row_patterns.append(build_row_name_patterns(row))
+        if t: t.update(1)
+    if t: t.close()
 
-        # Anonymize in second path
-        names_df = pd.read_csv(names_path)
-        all_names_series = pd.concat([names_df[col] for col in columns_with_names if col in names_df.columns])
-        # Clean names
-        name_list = (
-            all_names_series
-            .dropna()
-            .astype(str)
-            .str.strip()
-            .unique()
-            .tolist()
-        )
-        print(f"Loaded {len(name_list)} unique names to check.")
-
-        df[f'{args.column}_final_anonymized'] = df[f'{args.column}_anonymized'].apply(
-            lambda x: redact_names(x, name_list)
-)
-
-
-        df.to_csv(output_path, index=False)
-        print(f"Anonymized CSV saved to: {output_path}")
-
+    # PASS 1: Names-first (progress)
+    out_col_pass1 = f'{args.column}__pass1'
+    if TQDM_AVAILABLE:
+        tqdm.pandas(desc="Pass 1: redacting names")
+        df[out_col_pass1] = df[args.column].progress_apply(lambda t: redact_names_pass(t, all_row_patterns))
     else:
-        raise ValueError("Unsupported file type. Only .csv are supported.")
+        df[out_col_pass1] = df[args.column].apply(lambda t: redact_names_pass(t, all_row_patterns))
 
+    # PASS 2: PII via Presidio (progress)
+    nlp_engine = configure_nlp_engine()
+    def do_pass2(text):
+        analyzed = analyze_with_presidio(text, nlp_engine)
+        return anonymize_text(text, analyzed, redact_pronouns=args.redact_pronouns)
+
+    out_col_final = f'{args.column}_anonymized'
+    if TQDM_AVAILABLE:
+        tqdm.pandas(desc="Pass 2: PII anonymization")
+        df[out_col_final] = df[out_col_pass1].progress_apply(do_pass2)
+    else:
+        df[out_col_final] = df[out_col_pass1].apply(do_pass2)
+
+    df.to_csv(args.output, index=False)
+    print(f"Saved: {args.output}")
 
 if __name__ == '__main__':
     main()
