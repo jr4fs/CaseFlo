@@ -17,8 +17,6 @@ import argparse
 import re 
 from spacy.pipeline import EntityRuler
 
-# get a list of names -- full names and names of people, nicknames, 
-# christian will give us a list of names
 
 def enhance_spacy_with_rules(nlp):
     ruler = nlp.add_pipe("entity_ruler", before="ner")
@@ -41,15 +39,7 @@ def configure_nlp_engine(language='en'):
     return nlp_engine
 
 def analyze_text_with_presidio(text, nlp_engine, language='en'):
-    # titles_recognizer = PatternRecognizer(supported_entity="TITLE",
-    #                                       deny_list=["Mr.","Mrs.","Miss"])
-    # pronoun_recognizer = PatternRecognizer(supported_entity="PRONOUN",
-    #                                       deny_list=["he", "He", "his", "His", "she", "She", "her" "hers", "Hers"])
-
     analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=[language])
-    # analyzer.registry.add_recognizer(titles_recognizer)
-    # analyzer.registry.add_recognizer(pronoun_recognizer)
-
     results = analyzer.analyze(text=text, language=language)
     return results
 
@@ -87,10 +77,8 @@ def merge_results(presidio_results, spacy_results):
     presidio_results = presidio_results or []
     spacy_results = spacy_results or []
 
-    # Start with spaCy results — these take priority
     unique = {(r.start, r.end): r for r in spacy_results}
 
-    # Add Presidio results only if their span wasn't already seen
     for r in presidio_results:
         key = (r.start, r.end)
         if key not in unique:
@@ -116,18 +104,6 @@ def clean_cell(cell):
         return ' '.join(cell.split()).lower()  # Removes excessive whitespace and newlines
     return cell
 
-# def redact_names(text, names_to_redact, replacement="[REDACTED]"):
-#     if pd.isna(text):
-#         return text
-
-#     for name in names_to_redact:
-#         # Skip empty strings
-#         if not name.strip():
-#             continue
-#         # Regex to match name as whole word
-#         pattern = r'\b{}\b'.format(re.escape(name))
-#         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-#     return text
 def redact_names(text, names_to_redact, replacement="[REDACTED]"):
     if pd.isna(text):
         return text
