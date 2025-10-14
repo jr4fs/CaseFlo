@@ -51,7 +51,7 @@ REDACT_FIRST_MIDDLE_INITIAL_NO_LAST = True
 # Exempt common time words from DATE redaction (and "year/years")
 EXEMPT_TIME_TERMS = {
     "morning","afternoon","evening","night","tonight",
-    "today","yesterday","tomorrow","year","years"
+    "today","yesterday","tomorrow","year","years", "hour", "hours", "minute", "minutes", 
 }
 
 # Optional pronouns set for --redact_pronouns
